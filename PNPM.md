@@ -46,9 +46,9 @@ codex/
 ├── pnpm-workspace.yaml    # Workspace configuration
 ├── .npmrc                 # pnpm configuration
 ├── package.json           # Root dependencies and scripts
-├── codex-cli/             # Main package
-│   └── package.json       # codex-cli specific dependencies
-└── docs/                  # Documentation (future package)
+├── docs/                  # Documentation (future package)
+├── sdk/typescript/        # TypeScript SDK
+└── shell-tool-mcp/        # Shell tool MCP server
 ```
 
 ## Configuration files
