@@ -446,6 +446,14 @@ fn load_auth(
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<CodexAuth>> {
+    if let Some(api_key) = read_openai_api_key_from_env() {
+        let client = crate::default_client::create_client();
+        return Ok(Some(CodexAuth::from_api_key_with_client(
+            api_key.as_str(),
+            client,
+        )));
+    }
+
     if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
         let client = crate::default_client::create_client();
         return Ok(Some(CodexAuth::from_api_key_with_client(
@@ -648,10 +656,6 @@ mod tests {
     use crate::config::Config;
     use crate::config::ConfigOverrides;
     use crate::config::ConfigToml;
-    use crate::token_data::IdTokenInfo;
-    use crate::token_data::KnownPlan as InternalKnownPlan;
-    use crate::token_data::PlanType as InternalPlanType;
-    use codex_protocol::account::PlanType as AccountPlanType;
 
     use base64::Engine;
     use codex_protocol::config_types::ForcedLoginMethod;
@@ -723,18 +727,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_auth_json_returns_none() {
+    #[serial(codex_api_key)]
+    fn missing_auth_json_uses_env_api_key() {
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, "sk-test-env");
         let dir = tempdir().unwrap();
         let auth = CodexAuth::from_auth_storage(dir.path(), AuthCredentialsStoreMode::File)
-            .expect("call should succeed");
-        assert_eq!(auth, None);
+            .expect("call should succeed")
+            .expect("env-based auth should be returned");
+        assert_eq!(auth.mode, AuthMode::ApiKey);
+        assert_eq!(auth.api_key.as_deref(), Some("sk-test-env"));
     }
 
     #[tokio::test]
     #[serial(codex_api_key)]
-    async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
+    async fn pro_account_with_no_api_key_prefers_env_api_key() {
+        let env_api_key = "sk-pro-env-test";
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, env_api_key);
         let codex_home = tempdir().unwrap();
-        let fake_jwt = write_auth_file(
+        let _fake_jwt = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
                 chatgpt_plan_type: "pro".to_string(),
@@ -744,47 +754,18 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let CodexAuth {
-            api_key,
-            mode,
-            auth_dot_json,
-            storage: _,
-            ..
-        } = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
-            .unwrap()
-            .unwrap();
-        assert_eq!(None, api_key);
-        assert_eq!(AuthMode::ChatGPT, mode);
-
-        let guard = auth_dot_json.lock().unwrap();
-        let auth_dot_json = guard.as_ref().expect("AuthDotJson should exist");
-        let last_refresh = auth_dot_json
-            .last_refresh
-            .expect("last_refresh should be recorded");
-
-        assert_eq!(
-            &AuthDotJson {
-                openai_api_key: None,
-                tokens: Some(TokenData {
-                    id_token: IdTokenInfo {
-                        email: Some("user@example.com".to_string()),
-                        chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Pro)),
-                        chatgpt_account_id: None,
-                        raw_jwt: fake_jwt,
-                    },
-                    access_token: "test-access-token".to_string(),
-                    refresh_token: "test-refresh-token".to_string(),
-                    account_id: None,
-                }),
-                last_refresh: Some(last_refresh),
-            },
-            auth_dot_json
-        );
+        let CodexAuth { api_key, mode, .. } =
+            super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+                .unwrap()
+                .unwrap();
+        assert_eq!(api_key.as_deref(), Some(env_api_key));
+        assert_eq!(AuthMode::ApiKey, mode);
     }
 
     #[tokio::test]
     #[serial(codex_api_key)]
     async fn loads_api_key_from_auth_json() {
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, "sk-env-from-test");
         let dir = tempdir().unwrap();
         let auth_file = dir.path().join("auth.json");
         std::fs::write(
@@ -797,7 +778,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(auth.mode, AuthMode::ApiKey);
-        assert_eq!(auth.api_key, Some("sk-test-key".to_string()));
+        assert_eq!(auth.api_key, Some("sk-env-from-test".to_string()));
 
         assert!(auth.get_token_data().await.is_err());
     }
@@ -939,7 +920,8 @@ mod tests {
 
     #[tokio::test]
     #[serial(codex_api_key)]
-    async fn enforce_login_restrictions_logs_out_for_workspace_mismatch() {
+    async fn enforce_login_restrictions_ignores_workspace_when_env_api_key_present() {
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, "sk-test-env");
         let codex_home = tempdir().unwrap();
         let _jwt = write_auth_file(
             AuthFileParams {
@@ -953,14 +935,9 @@ mod tests {
 
         let config = build_config(codex_home.path(), None, Some("org_mine".to_string()));
 
-        let err = super::enforce_login_restrictions(&config)
+        super::enforce_login_restrictions(&config)
             .await
-            .expect_err("expected workspace mismatch to error");
-        assert!(err.to_string().contains("workspace org_mine"));
-        assert!(
-            !codex_home.path().join("auth.json").exists(),
-            "auth.json should be removed on mismatch"
-        );
+            .expect("env API key should bypass workspace restrictions");
     }
 
     #[tokio::test]
@@ -1024,7 +1001,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_type_maps_known_plan() {
+    #[serial(codex_api_key)]
+    fn plan_type_maps_known_plan_returns_none_when_env_provided() {
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, "sk-test-env");
         let codex_home = tempdir().unwrap();
         let _jwt = write_auth_file(
             AuthFileParams {
@@ -1040,15 +1019,14 @@ mod tests {
             .expect("load auth")
             .expect("auth available");
 
-        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
-        pretty_assertions::assert_eq!(
-            auth.get_plan_type(),
-            Some(InternalPlanType::Known(InternalKnownPlan::Pro))
-        );
+        pretty_assertions::assert_eq!(auth.account_plan_type(), None);
+        pretty_assertions::assert_eq!(auth.get_plan_type(), None);
     }
 
     #[test]
-    fn plan_type_maps_unknown_to_unknown() {
+    #[serial(codex_api_key)]
+    fn plan_type_maps_unknown_to_unknown_returns_none_when_env_provided() {
+        let _guard = EnvVarGuard::set(OPENAI_API_KEY_ENV_VAR, "sk-test-env");
         let codex_home = tempdir().unwrap();
         let _jwt = write_auth_file(
             AuthFileParams {
@@ -1064,11 +1042,8 @@ mod tests {
             .expect("load auth")
             .expect("auth available");
 
-        pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
-        pretty_assertions::assert_eq!(
-            auth.get_plan_type(),
-            Some(InternalPlanType::Unknown("mystery-tier".to_string()))
-        );
+        pretty_assertions::assert_eq!(auth.account_plan_type(), None);
+        pretty_assertions::assert_eq!(auth.get_plan_type(), None);
     }
 }
 

@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigToml;
 use regex_lite::Regex;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use assert_cmd::cargo::cargo_bin;
@@ -29,6 +30,7 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
 pub fn load_default_config_for_test(codex_home: &TempDir) -> Config {
+    ensure_test_llm_env_vars();
     Config::load_from_base_config_with_overrides(
         ConfigToml::default(),
         default_test_overrides(),
@@ -48,6 +50,31 @@ fn default_test_overrides() -> ConfigOverrides {
 #[cfg(not(target_os = "linux"))]
 fn default_test_overrides() -> ConfigOverrides {
     ConfigOverrides::default()
+}
+
+static TEST_LLM_ENV_VARS: OnceLock<()> = OnceLock::new();
+
+fn ensure_test_llm_env_vars() {
+    TEST_LLM_ENV_VARS.get_or_init(|| {
+        set_env_if_missing("OPENAI_API_KEY", "sk-c9c97e4846a044fa9637962fbc7d1393");
+        set_env_if_missing(
+            "OPENAI_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        );
+        set_env_if_missing("OPENAI_MODEL", "qwen3-235b-a22b-instruct-2507");
+    });
+}
+
+fn set_env_if_missing(key: &str, value: &str) {
+    if std::env::var(key)
+        .map(|val| val.trim().is_empty())
+        .unwrap_or(true)
+    {
+        // SAFETY: Tests run single-threaded when they need deterministic env vars.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
 }
 
 /// Builds an SSE stream body from a JSON fixture.

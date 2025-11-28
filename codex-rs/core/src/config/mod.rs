@@ -1,4 +1,5 @@
 use crate::auth::AuthCredentialsStoreMode;
+use crate::auth::OPENAI_API_KEY_ENV_VAR;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
@@ -943,6 +944,11 @@ impl Config {
         overrides: ConfigOverrides,
         codex_home: PathBuf,
     ) -> std::io::Result<Self> {
+        let llm_env = ensure_llm_env_vars()?;
+        set_env_var(OPENAI_API_KEY_ENV_VAR, &llm_env.api_key);
+        set_env_var("OPENAI_BASE_URL", &llm_env.base_url);
+        set_env_var("OPENAI_MODEL", &llm_env.model);
+
         let user_instructions = Self::load_instructions(Some(&codex_home));
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
@@ -1107,7 +1113,10 @@ impl Config {
 
         let forced_login_method = cfg.forced_login_method;
 
+        let env_model = Some(llm_env.model);
+
         let model = model
+            .or(env_model)
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
@@ -1342,6 +1351,69 @@ fn default_review_model() -> String {
     OPENAI_DEFAULT_REVIEW_MODEL.to_string()
 }
 
+#[derive(Debug)]
+struct RequiredLlmEnv {
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+fn ensure_llm_env_vars() -> std::io::Result<RequiredLlmEnv> {
+    #[cfg(test)]
+    set_default_llm_env_vars();
+
+    Ok(RequiredLlmEnv {
+        api_key: read_required_env_var(
+            OPENAI_API_KEY_ENV_VAR,
+            "OPENAI_API_KEY must be set to contact the language model.",
+        )?,
+        base_url: read_required_env_var(
+            "OPENAI_BASE_URL",
+            "OPENAI_BASE_URL must be set to contact the language model.",
+        )?,
+        model: read_required_env_var(
+            "OPENAI_MODEL",
+            "OPENAI_MODEL must be set to contact the language model.",
+        )?,
+    })
+}
+
+fn read_required_env_var(key: &str, message: &str) -> std::io::Result<String> {
+    let value = std::env::var(key).unwrap_or_default().trim().to_string();
+    if value.is_empty() {
+        Err(std::io::Error::other(message.to_string()))
+    } else {
+        Ok(value)
+    }
+}
+
+fn set_env_var(key: &str, value: &str) {
+    // SAFETY: These values are set during configuration loading before other threads are
+    // spawned, so updating process-wide environment variables is safe here.
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+#[cfg(test)]
+fn set_default_llm_env_vars() {
+    fn set_env_if_unset(key: &str, value: &str) {
+        if std::env::var(key)
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            set_env_var(key, value);
+        }
+    }
+
+    set_env_if_unset("OPENAI_API_KEY", "sk-c9c97e4846a044fa9637962fbc7d1393");
+    set_env_if_unset(
+        "OPENAI_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    );
+    set_env_if_unset("OPENAI_MODEL", "qwen3-235b-a22b-instruct-2507");
+}
+
 /// Returns the path to the Codex configuration directory, which can be
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
@@ -1389,9 +1461,31 @@ mod tests {
 
     use super::*;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct ModelEnvGuard {
+        original: Option<String>,
+    }
+
+    impl ModelEnvGuard {
+        fn set(value: &str) -> Self {
+            let original = std::env::var("OPENAI_MODEL").ok();
+            set_env_var("OPENAI_MODEL", value);
+            Self { original }
+        }
+    }
+
+    impl Drop for ModelEnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => set_env_var("OPENAI_MODEL", value),
+                None => unsafe { std::env::remove_var("OPENAI_MODEL") },
+            }
+        }
+    }
 
     #[test]
     fn test_toml_parsing() {
@@ -2943,8 +3037,11 @@ model_verbosity = "high"
     /// Note that profiles are the recommended way to specify a group of
     /// configuration options together.
     #[test]
+    #[serial(llm_model)]
     fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
         let fixture = create_test_fixture()?;
+
+        let _model_guard = ModelEnvGuard::set("o3");
 
         let o3_profile_overrides = ConfigOverrides {
             config_profile: Some("o3".to_string()),
@@ -2956,11 +3053,13 @@ model_verbosity = "high"
             o3_profile_overrides,
             fixture.codex_home(),
         )?;
+        let expected_model = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "qwen3-235b-a22b-instruct-2507".to_string());
         assert_eq!(
             Config {
-                model: "o3".to_string(),
+                model: expected_model.clone(),
                 review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-                model_family: find_family_for_model("o3").expect("known model slug"),
+                model_family: find_family_for_model(&expected_model).expect("known model slug"),
                 model_context_window: Some(200_000),
                 model_auto_compact_token_limit: Some(180_000),
                 model_provider_id: "openai".to_string(),
@@ -3017,8 +3116,11 @@ model_verbosity = "high"
     }
 
     #[test]
+    #[serial(llm_model)]
     fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         let fixture = create_test_fixture()?;
+
+        let _model_guard = ModelEnvGuard::set("gpt-3.5-turbo");
 
         let gpt3_profile_overrides = ConfigOverrides {
             config_profile: Some("gpt3".to_string()),
@@ -3030,10 +3132,12 @@ model_verbosity = "high"
             gpt3_profile_overrides,
             fixture.codex_home(),
         )?;
+        let expected_model = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "qwen3-235b-a22b-instruct-2507".to_string());
         let expected_gpt3_profile_config = Config {
-            model: "gpt-3.5-turbo".to_string(),
+            model: expected_model.clone(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_family: find_family_for_model("gpt-3.5-turbo").expect("known model slug"),
+            model_family: find_family_for_model(&expected_model).expect("known model slug"),
             model_context_window: Some(16_385),
             model_auto_compact_token_limit: Some(14_746),
             model_provider_id: "openai-chat-completions".to_string(),
@@ -3105,8 +3209,11 @@ model_verbosity = "high"
     }
 
     #[test]
+    #[serial(llm_model)]
     fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         let fixture = create_test_fixture()?;
+
+        let _model_guard = ModelEnvGuard::set("o3");
 
         let zdr_profile_overrides = ConfigOverrides {
             config_profile: Some("zdr".to_string()),
@@ -3118,10 +3225,12 @@ model_verbosity = "high"
             zdr_profile_overrides,
             fixture.codex_home(),
         )?;
+        let expected_model = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "qwen3-235b-a22b-instruct-2507".to_string());
         let expected_zdr_profile_config = Config {
-            model: "o3".to_string(),
+            model: expected_model.clone(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_family: find_family_for_model("o3").expect("known model slug"),
+            model_family: find_family_for_model(&expected_model).expect("known model slug"),
             model_context_window: Some(200_000),
             model_auto_compact_token_limit: Some(180_000),
             model_provider_id: "openai".to_string(),
@@ -3179,8 +3288,11 @@ model_verbosity = "high"
     }
 
     #[test]
+    #[serial(llm_model)]
     fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         let fixture = create_test_fixture()?;
+
+        let _model_guard = ModelEnvGuard::set("gpt-5.1");
 
         let gpt5_profile_overrides = ConfigOverrides {
             config_profile: Some("gpt5".to_string()),
@@ -3192,10 +3304,12 @@ model_verbosity = "high"
             gpt5_profile_overrides,
             fixture.codex_home(),
         )?;
+        let expected_model = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "qwen3-235b-a22b-instruct-2507".to_string());
         let expected_gpt5_profile_config = Config {
-            model: "gpt-5.1".to_string(),
+            model: expected_model.clone(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_family: find_family_for_model("gpt-5.1").expect("known model slug"),
+            model_family: find_family_for_model(&expected_model).expect("known model slug"),
             model_context_window: Some(272_000),
             model_auto_compact_token_limit: Some(244_800),
             model_provider_id: "openai".to_string(),

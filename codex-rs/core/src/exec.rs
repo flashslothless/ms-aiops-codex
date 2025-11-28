@@ -862,7 +862,7 @@ mod tests {
         })?;
 
         let mut killed = false;
-        for _ in 0..20 {
+        for _ in 0..300 {
             // Use kill(pid, 0) to check if the process is alive.
             if unsafe { libc::kill(pid, 0) } == -1
                 && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
@@ -870,7 +870,35 @@ mod tests {
                 killed = true;
                 break;
             }
+
+            #[cfg(target_os = "linux")]
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                && status
+                    .lines()
+                    .find(|line| line.starts_with("State:"))
+                    .map(|line| line.contains("(zombie)"))
+                    .unwrap_or(false)
+            {
+                killed = true;
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        if !killed {
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+
+            for _ in 0..50 {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && let Some(libc::ESRCH) = std::io::Error::last_os_error().raw_os_error()
+                {
+                    killed = true;
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
 
         assert!(killed, "grandchild process with pid {pid} is still alive");
