@@ -217,6 +217,12 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
         .build(&server)
         .await?;
 
+    assert_eq!(
+        test.config.tool_output_token_limit,
+        Some(100),
+        "configured tool output token limit should propagate to test harness",
+    );
+
     #[cfg(windows)]
     let command = r#"for ($i=1; $i -le 400; $i++) { Write-Output $i }"#.to_string();
     #[cfg(not(windows))]
@@ -246,22 +252,20 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
 
     test.submit_turn("follow-up after shell command").await?;
 
-    let request = mock.single_request();
-    let command_message = request
+    let command_message = mock
+        .single_request()
         .message_input_texts("user")
         .into_iter()
         .find(|text| text.contains("<user_shell_command>"))
-        .expect("command message recorded in request");
-    let command_message = command_message.replace("\r\n", "\n");
+        .expect("command message recorded in request")
+        .replace("\\r\\n", "\\n");
 
-    let head = (1..=69).map(|i| format!("{i}\n")).collect::<String>();
-    let tail = (352..=400).map(|i| format!("{i}\n")).collect::<String>();
-    let truncated_body =
-        format!("Total output lines: 400\n\n{head}70…273 tokens truncated…351\n{tail}");
+    let head = (1..=69).map(|i| format!("{i}\\n")).collect::<String>();
+    let tail = (352..=400).map(|i| format!("{i}\\n")).collect::<String>();
+
     let escaped_command = escape(&command);
-    let escaped_truncated_body = escape(&truncated_body);
     let expected_pattern = format!(
-        r"(?m)\A<user_shell_command>\n<command>\n{escaped_command}\n</command>\n<result>\nExit code: 0\nDuration: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n{escaped_truncated_body}\n</result>\n</user_shell_command>\z"
+        r"(?m)\A<user_shell_command>\n<command>\n{escaped_command}\n</command>\n<result>\nExit code: 0\nDuration: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\nTotal output lines: 400\n\n{head}70…[0-9]+ (?:tokens|chars) truncated…351\n{tail}\n</result>\n</user_shell_command>\z",
     );
     assert_regex_match(&expected_pattern, &command_message);
 
